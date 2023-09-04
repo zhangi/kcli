@@ -1,9 +1,12 @@
 package kafka
 
 import (
+	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"hash"
 	"io/ioutil"
 	"os"
 	"sort"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
+	"github.com/xdg/scram"
 )
 
 // Decoder is the interface that is required of plugins
@@ -23,7 +27,7 @@ type plainDecoder struct{}
 
 func (p plainDecoder) Decode(topic string, data []byte) ([]byte, error) { return data, nil }
 
-//Client fetches from kafka
+// Client fetches from kafka
 type Client struct {
 	addrs       []string
 	sarama      sarama.Client
@@ -31,7 +35,7 @@ type Client struct {
 	concurrency int
 }
 
-//Partition holds information about a kafka partition
+// Partition holds information about a kafka partition
 type Partition struct {
 	Topic     string `json:"topic"`
 	Partition int32  `json:"partition"`
@@ -41,13 +45,13 @@ type Partition struct {
 	Filter    string `json:"filter"`
 }
 
-//String turns a partition into a string
+// String turns a partition into a string
 func (p *Partition) String() string {
 	d, _ := json.Marshal(p)
 	return string(d)
 }
 
-//Message holds information about a single kafka message
+// Message holds information about a single kafka message
 type Message struct {
 	Partition Partition `json:"partition"`
 	Value     []byte    `json:"msg"`
@@ -57,7 +61,7 @@ type Message struct {
 // Opt is a func that sets an  attribute on Client
 type Opt func(*Client)
 
-//New returns a kafka Client.
+// New returns a kafka Client.
 func New(addrs []string, opts ...Opt) (*Client, error) {
 	cfg, err := getConfig()
 	if err != nil {
@@ -97,8 +101,45 @@ func WithDecoder(d Decoder) func(*Client) {
 	}
 }
 
+var SHA256 scram.HashGeneratorFcn = func() hash.Hash { return sha256.New() }
+var SHA512 scram.HashGeneratorFcn = func() hash.Hash { return sha512.New() }
+
+type XDGSCRAMClient struct {
+	*scram.Client
+	*scram.ClientConversation
+	scram.HashGeneratorFcn
+}
+
+func (x *XDGSCRAMClient) Begin(userName, password, authzID string) (err error) {
+	x.Client, err = x.HashGeneratorFcn.NewClient(userName, password, authzID)
+	if err != nil {
+		return err
+	}
+	x.ClientConversation = x.Client.NewConversation()
+	return nil
+}
+
+func (x *XDGSCRAMClient) Step(challenge string) (response string, err error) {
+	response, err = x.ClientConversation.Step(challenge)
+	return
+}
+
+func (x *XDGSCRAMClient) Done() bool {
+	return x.ClientConversation.Done()
+}
+
 func getConfig() (*sarama.Config, error) {
 	cfg := sarama.NewConfig()
+
+	cfg.Net.SASL.User = os.Getenv("KCLI_USERNAME")
+	if cfg.Net.SASL.User != "" {
+		cfg.Net.SASL.Enable = true
+		cfg.Net.SASL.Password = os.Getenv("KCLI_PASSWORD")
+		cfg.Net.SASL.Handshake = true
+		cfg.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
+		cfg.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+	}
+
 	tlsCfg, err := getTLSConfig()
 	if err != nil || tlsCfg == nil {
 		return cfg, err
@@ -139,12 +180,12 @@ func getTLSConfig() (*tls.Config, error) {
 	return &cfg, nil
 }
 
-//GetTopics gets topics (duh)
+// GetTopics gets topics (duh)
 func (c *Client) GetTopics() ([]string, error) {
 	return c.sarama.Topics()
 }
 
-//GetTopic gets a single kafka topic
+// GetTopic gets a single kafka topic
 func (c *Client) GetTopic(topic string) ([]Partition, error) {
 	partitions, err := c.sarama.Partitions(topic)
 	if err != nil {
@@ -174,8 +215,8 @@ func (c *Client) GetTopic(topic string) ([]Partition, error) {
 	return out, nil
 }
 
-//GetPartition fetches a kafka partition.  It includes a callback func
-//so that the caller can tell it when to stop consuming.
+// GetPartition fetches a kafka partition.  It includes a callback func
+// so that the caller can tell it when to stop consuming.
 func (c *Client) GetPartition(part Partition, end int, f func([]byte) bool) ([]Message, error) {
 	consumer, err := sarama.NewConsumer(c.addrs, nil)
 	if err != nil {
@@ -227,7 +268,7 @@ func (c *Client) GetPartition(part Partition, end int, f func([]byte) bool) ([]M
 	return out, nil
 }
 
-//Close disconnects from kafka
+// Close disconnects from kafka
 func (c *Client) Close() {
 	c.sarama.Close()
 }
@@ -238,7 +279,7 @@ type searchResult struct {
 	error     error
 }
 
-//SearchTopic allows the caller to search across all partitions in a topic.
+// SearchTopic allows the caller to search across all partitions in a topic.
 func (c *Client) SearchTopic(partitions []Partition, s string, firstResult bool, cb func(int64, int64)) ([]Partition, error) {
 	ch := make(chan searchResult)
 	in := make(chan Partition)
@@ -312,13 +353,13 @@ func (c *Client) search(info Partition, s string, stop func() bool, cb func(int6
 	return n, err
 }
 
-//Search is for searching for a string in a single kafka partition.
-//It stops at the first match.
+// Search is for searching for a string in a single kafka partition.
+// It stops at the first match.
 func (c *Client) Search(info Partition, s string, cb func(i, j int64)) (int64, error) {
 	return c.search(info, s, func() bool { return false }, cb)
 }
 
-//Fetch gets all messages in a partition up intil the 'end' offset.
+// Fetch gets all messages in a partition up intil the 'end' offset.
 func (c *Client) Fetch(info Partition, end int64, cb func(string)) error {
 	return c.consume(info, end, func(msg []byte) bool {
 		val, err := c.decoder.Decode(info.Topic, msg)
